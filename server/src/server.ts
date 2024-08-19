@@ -1,13 +1,10 @@
-// src/server.ts
-import express, { Request, Response } from "express";
+import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-import httpProxy from "http-proxy";
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
-const proxy = httpProxy.createProxyServer({});
 const port = 8080;
 
 interface Client {
@@ -15,37 +12,68 @@ interface Client {
   target: string;
 }
 
-const clients: Record<string, Client> = {};
+let client: Client | null = null;
 
+// WebSocket server for client connections
 wss.on("connection", (ws) => {
   ws.on("message", (message) => {
     const data = JSON.parse(message.toString());
     if (data.type === "register") {
-      clients[data.id] = { ws, target: data.target };
-      console.log(`Client registered: ${data.id}`);
+      client = { ws, target: data.target };
+      console.log(`Client registered: ${data.target}`);
+    } else if (data.type === "response" && data.responseId) {
+      // Find the request corresponding to the response and forward the response
+      const requestResponseMap = requestMap[data.responseId];
+      if (requestResponseMap) {
+        requestResponseMap.res.writeHead(data.statusCode, data.headers);
+        requestResponseMap.res.end(data.body);
+        delete requestMap[data.responseId];
+      }
     }
   });
 
   ws.on("close", () => {
-    for (const id in clients) {
-      if (clients[id].ws === ws) {
-        delete clients[id];
-        console.log(`Client disconnected: ${id}`);
-        break;
-      }
+    if (client && client.ws === ws) {
+      client = null;
+      console.log(`Client disconnected`);
     }
   });
 });
 
-app.use((req: Request, res: Response) => {
-  const clientId = req.headers["x-client-id"] as string;
-  if (clientId && clients[clientId]) {
-    proxy.web(req, res, { target: clients[clientId].target });
+// Map to store pending requests
+const requestMap: Record<
+  string,
+  { req: http.IncomingMessage; res: http.ServerResponse }
+> = {};
+
+// Express middleware to handle requests
+app.use((req, res) => {
+  if (client) {
+    const requestId = Math.random().toString(36).substring(2); // Generate a unique ID for the request
+    requestMap[requestId] = { req, res };
+
+    const message = {
+      type: "request",
+      requestId,
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: "",
+    };
+
+    req.on("data", (chunk) => {
+      message.body += chunk.toString();
+    });
+
+    req.on("end", () => {
+      client?.ws.send(JSON.stringify(message));
+    });
   } else {
-    res.status(404).send("Client not found");
+    res.status(502).send("No client connected");
   }
 });
 
+// Start the server
 server.listen(port, () => {
   console.log(`Server started on port ${port}`);
 });
